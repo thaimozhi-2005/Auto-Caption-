@@ -116,7 +116,7 @@ class LogChannelManager:
             }.get(log_entry["severity"], "📝")
             
             message = (
-                f"{severity_emoji} **{log_entry['type']}**\n"
+                f"{severity_emoji} *{log_entry['type']}*\n"
                 f"🕒 {log_entry['timestamp']}\n"
                 f"📄 {log_entry['details']}\n"
             )
