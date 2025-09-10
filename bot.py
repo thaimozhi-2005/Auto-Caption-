@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-
 """
 Professional Telegram Bot for Anime Caption Formatting
 Enhanced with prefix management, dump channel functionality, log channel monitoring, and Render deployment ready
+WITH HTTP HEALTH CHECK SERVER FOR RENDER WEB SERVICE
 """
-
 import re
 import logging
 import json
@@ -15,28 +14,59 @@ from telegram import Update, BotCommand
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 from telegram.error import TelegramError
 import traceback
+from threading import Thread
+import uvicorn
+from fastapi import FastAPI
+
+# =============================================================================
+# RENDER WEB SERVICE COMPATIBILITY - HTTP SERVER
+# =============================================================================
+# Create FastAPI app for health checks
+fastapi_app = FastAPI(title="Telegram Bot Health Check")
+@fastapi_app.get("/")
+@fastapi_app.get("/health")
+async def health_check():
+    """Health check endpoint for Render"""
+    return {
+        "status": "healthy",
+        "bot": "Professional Anime Caption Formatter",
+        "uptime": str(datetime.now(timezone.utc) - bot_stats.get("start_time", datetime.now(timezone.utc))),
+        "messages_processed": bot_stats.get("messages_processed", 0)
+    }
+@fastapi_app.get("/stats")
+async def api_stats():
+    """API endpoint for bot statistics"""
+    uptime = datetime.now(timezone.utc) - bot_stats.get("start_time", datetime.now(timezone.utc))
+    return {
+        "uptime_seconds": uptime.total_seconds(),
+        "messages_processed": bot_stats.get("messages_processed", 0),
+        "successful_formats": bot_stats.get("successful_formats", 0),
+        "failed_formats": bot_stats.get("failed_formats", 0),
+        "dump_channel_sends": bot_stats.get("dump_channel_sends", 0),
+        "errors": bot_stats.get("errors", 0)
+    }
+def start_health_server():
+    """Start HTTP server for Render health checks"""
+    port = int(os.environ.get("PORT", 10000))  # Render uses PORT env var
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=port, log_level="warning")
 
 # =============================================================================
 # CONFIGURATION SECTION - Render Ready
 # =============================================================================
-
 # Environment variables for security (set these in Render dashboard)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8480202493:AAHMwt8_S1jvYnDynbpKvmWPuTI2_q4HAN0")
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "")  # Set this in Render environment
 DUMP_CHANNEL_ID = os.getenv("DUMP_CHANNEL_ID", "")  # Optional default dump channel
-
 # Global variables
 fixed_anime_name = ""
 dump_channel_id = DUMP_CHANNEL_ID
 log_channel_id = LOG_CHANNEL_ID
-
 # Configuration file (will work on Render's ephemeral storage)
 CONFIG_FILE = "bot_config.json"
 
 # =============================================================================
 # LOGGING SETUP WITH ENHANCED FORMATTING
 # =============================================================================
-
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -46,10 +76,8 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # GLOBAL VARIABLES FOR PREFIX ROTATION AND SETTINGS
 # =============================================================================
-
 message_count = 0
 prefixes = ["/leech -n", "/leech1 -n", "/leech2 -n", "/leechx -n", "/leech4 -n", "/leech3 -n", "/leech5 -n"]
-
 # Bot statistics for monitoring
 bot_stats = {
     "start_time": datetime.now(timezone.utc),
@@ -64,21 +92,17 @@ bot_stats = {
 # =============================================================================
 # LOG CHANNEL SYSTEM
 # =============================================================================
-
 class LogChannelManager:
     """Enhanced logging system with Telegram channel integration"""
-    
     def __init__(self, bot_context=None):
         self.bot_context = bot_context
         self.log_channel = log_channel_id
         self.message_buffer = []
         self.buffer_size = 10  # Send logs in batches
-        
+
     async def log_action(self, action_type, details, user_info=None, severity="INFO"):
         """Log action to both file and Telegram channel"""
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        
-        # Create log entry
         log_entry = {
             "timestamp": timestamp,
             "type": action_type,
@@ -86,12 +110,10 @@ class LogChannelManager:
             "details": details,
             "user": user_info
         }
-        
-        # Log to console/file
         log_msg = f"[{severity}] {action_type}: {details}"
         if user_info:
             log_msg += f" | User: {user_info}"
-            
+
         if severity == "ERROR":
             logger.error(log_msg)
             bot_stats["errors"] += 1
@@ -99,42 +121,35 @@ class LogChannelManager:
             logger.warning(log_msg)
         else:
             logger.info(log_msg)
-        
-        # Send to log channel if configured
+
         if self.log_channel and self.bot_context:
             await self._send_to_log_channel(log_entry)
-    
+
     async def _send_to_log_channel(self, log_entry):
         """Send formatted log to Telegram log channel"""
         try:
-            # Create formatted message
             severity_emoji = {
                 "INFO": "ℹ️",
-                "WARNING": "⚠️", 
+                "WARNING": "⚠️",
                 "ERROR": "❌",
                 "SUCCESS": "✅"
             }.get(log_entry["severity"], "📝")
-            
             message = (
                 f"{severity_emoji} **{log_entry['type']}**\n"
                 f"🕒 {log_entry['timestamp']}\n"
                 f"📄 {log_entry['details']}\n"
             )
-            
             if log_entry.get("user"):
                 message += f"👤 User: {log_entry['user']}\n"
-            
             message += f"🔢 Stats: {bot_stats['messages_processed']} processed, {bot_stats['errors']} errors"
-            
             await self.bot_context.bot.send_message(
                 chat_id=self.log_channel,
                 text=message,
                 parse_mode='Markdown'
             )
-            
         except Exception as e:
             logger.error(f"Failed to send to log channel: {e}")
-    
+
     async def log_bot_start(self):
         """Log bot startup"""
         await self.log_action(
@@ -142,7 +157,7 @@ class LogChannelManager:
             f"Professional Anime Bot started successfully. Prefix count: {len(prefixes)}, Dump channel: {'✅' if dump_channel_id else '❌'}",
             severity="SUCCESS"
         )
-    
+
     async def log_user_command(self, command, user_info, success=True):
         """Log user command execution"""
         severity = "SUCCESS" if success else "WARNING"
@@ -152,7 +167,7 @@ class LogChannelManager:
             user_info,
             severity
         )
-    
+
     async def log_format_action(self, original, formatted, user_info, success=True):
         """Log caption formatting action"""
         if success:
@@ -171,7 +186,7 @@ class LogChannelManager:
                 user_info,
                 "WARNING"
             )
-    
+
     async def log_dump_channel_action(self, success, error_msg=None, user_info=None):
         """Log dump channel operations"""
         if success:
@@ -190,11 +205,10 @@ class LogChannelManager:
                 user_info,
                 "ERROR"
             )
-    
+
     async def send_stats_report(self):
         """Send periodic stats report"""
         uptime = datetime.now(timezone.utc) - bot_stats["start_time"]
-        
         stats_msg = (
             f"📊 **Bot Statistics Report**\n\n"
             f"⏰ **Uptime:** {uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m\n"
@@ -207,7 +221,6 @@ class LogChannelManager:
             f"🎯 **Success Rate:** {(bot_stats['successful_formats']/(bot_stats['successful_formats']+bot_stats['failed_formats'])*100) if (bot_stats['successful_formats']+bot_stats['failed_formats']) > 0 else 0:.1f}%\n"
             f"📱 **Current Config:** {len(prefixes)} prefixes, Dump: {'✅' if dump_channel_id else '❌'}"
         )
-        
         if self.log_channel and self.bot_context:
             try:
                 await self.bot_context.bot.send_message(
@@ -224,7 +237,6 @@ log_manager = LogChannelManager()
 # =============================================================================
 # CONFIGURATION MANAGEMENT - Enhanced for Render
 # =============================================================================
-
 def save_config():
     """Save bot configuration to file (works on Render ephemeral storage)"""
     config = {
@@ -235,11 +247,8 @@ def save_config():
         "log_channel_id": log_channel_id,
         "stats": bot_stats.copy()
     }
-    
-    # Convert datetime to string for JSON serialization
     if "start_time" in config["stats"]:
         config["stats"]["start_time"] = config["stats"]["start_time"].isoformat()
-    
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
@@ -250,22 +259,17 @@ def save_config():
 def load_config():
     """Load bot configuration from file"""
     global fixed_anime_name, prefixes, dump_channel_id, message_count, log_channel_id
-    
     if not os.path.exists(CONFIG_FILE):
         save_config()
         return
-    
     try:
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
-        
         fixed_anime_name = config.get("fixed_anime_name", "")
         prefixes = config.get("prefixes", ["/leech -n", "/leech1 -n", "/leech2 -n", "/leechx -n", "/leech4 -n", "/leech3 -n", "/leech5 -n"])
         dump_channel_id = config.get("dump_channel_id", DUMP_CHANNEL_ID)
         log_channel_id = config.get("log_channel_id", LOG_CHANNEL_ID)
         message_count = config.get("message_count", 0)
-        
-        # Load stats if available
         if "stats" in config:
             saved_stats = config["stats"]
             if "start_time" in saved_stats and isinstance(saved_stats["start_time"], str):
@@ -274,7 +278,6 @@ def load_config():
                     bot_stats["start_time"] = datetime.fromisoformat(saved_stats["start_time"])
                 except:
                     bot_stats["start_time"] = datetime.now(timezone.utc)
-        
         logger.info("Configuration loaded successfully")
     except Exception as e:
         logger.error(f"Failed to load config: {e}")
@@ -283,12 +286,10 @@ def load_config():
 # =============================================================================
 # QUALITY ORDERING CONFIGURATION (Same as original)
 # =============================================================================
-
 QUALITY_ORDER = ["480P", "720P", "1080P"]
 
 class AnimeParser:
     """Enhanced anime caption parser with multiple format support and professional quality handling"""
-    
     def __init__(self):
         self.patterns = {
             'bracket_se': r'\[S(\d+)\s*E(\d+)\]',
@@ -299,18 +300,15 @@ class AnimeParser:
             'simple_se': r'S(\d+)\s*E(\d+)',
             'simple_ep': r'S(\d+)\s*EP(\d+)',
         }
-    
+
     def extract_episode_info(self, text):
         """Extract season, episode, and anime name from various formats"""
         season = "01"
         episode = "01"
         anime_name = ""
-        
         clean_text = text.strip()
-        
         if "📺" in clean_text and "Eᴘɪꜱᴏᴅᴇ" in clean_text:
             return self._parse_structured_format(clean_text)
-        
         for pattern_name in ['channel_se', 'channel_bracket']:
             pattern = self.patterns[pattern_name]
             match = re.search(pattern, clean_text, re.IGNORECASE)
@@ -320,7 +318,6 @@ class AnimeParser:
                 else:
                     season, episode, anime_name = match.groups()
                 return season.zfill(2), episode.zfill(2), anime_name.strip()
-        
         for pattern_name in ['bracket_se', 'bracket_sep']:
             pattern = self.patterns[pattern_name]
             match = re.search(pattern, clean_text, re.IGNORECASE)
@@ -328,7 +325,6 @@ class AnimeParser:
                 season, episode = match.groups()
                 anime_name = re.split(r'\[S\d+', clean_text, flags=re.IGNORECASE)[0].strip()
                 return season.zfill(2), episode.zfill(2), anime_name
-        
         for pattern_name in ['simple_se', 'simple_ep']:
             pattern = self.patterns[pattern_name]
             match = re.search(pattern, clean_text, re.IGNORECASE)
@@ -336,26 +332,22 @@ class AnimeParser:
                 season, episode = match.groups()
                 anime_name = re.split(r'S\d+', clean_text, flags=re.IGNORECASE)[0].strip()
                 return season.zfill(2), episode.zfill(2), anime_name
-        
         return season, episode, clean_text
-    
+
     def _parse_structured_format(self, text):
         """Parse structured format with emojis"""
         season = "01"
         episode = "01"
         anime_name = ""
-        
         title_match = re.search(r'📺\s*([^\[]+)\s*\[S(\d+)\]', text, re.IGNORECASE)
         if title_match:
             anime_name = title_match.group(1).strip()
             season = title_match.group(2).zfill(2)
-        
         episode_match = re.search(r'Eᴘɪꜱᴏᴅᴇ\s*:\s*(\d+)', text, re.IGNORECASE)
         if episode_match:
             episode = episode_match.group(1).zfill(2)
-        
         return season, episode, anime_name
-    
+
     def extract_quality(self, text):
         """Extract video quality from text and ensure it ends with 'P'"""
         quality_patterns = [
@@ -365,16 +357,14 @@ class AnimeParser:
             r'QUALITY\s*:\s*(\d+)[pP]?',
             r'(\d+)\s*[pP]',
         ]
-        
         for pattern in quality_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 quality_number = match.group(1)
                 if int(quality_number) in [144, 240, 360, 480, 720, 1080, 1440, 2160]:
                     return f"{quality_number}P"
-        
         return "720P"
-    
+
     def extract_language(self, text):
         """Extract language/audio information"""
         language_mappings = {
@@ -388,51 +378,41 @@ class AnimeParser:
             'dual audio': 'Dual',
             'dual': 'Dual',
         }
-        
         audio_match = re.search(r'(?:Aᴜᴅɪᴏ|Audio)\s*:\s*([^,\n\]]+)', text, re.IGNORECASE)
         if audio_match:
             audio_text = audio_match.group(1).strip().lower()
             for key, value in language_mappings.items():
                 if key in audio_text:
                     return value
-        
         text_lower = text.lower()
         for key, value in language_mappings.items():
             if key in text_lower:
                 return value
-        
         return ""
-    
+
     def clean_anime_name(self, name):
         """Clean and standardize anime name"""
         if not name:
             return ""
-        
         name = re.sub(r'^@\w+\s*-\s*', '', name, flags=re.IGNORECASE)
-        
         unwanted_patterns = [
             r'\[.*?\]',
             r'\(.*?\)',
             r'^\s*-\s*',
             r'\s*-\s*$',
         ]
-        
         for pattern in unwanted_patterns:
             name = re.sub(pattern, '', name, flags=re.IGNORECASE)
-        
         replacements = {
             'Tamil': 'Tam',
             'English': 'Eng',
             'Dubbed': 'Dub',
             'Subbed': 'Sub',
         }
-        
         for old, new in replacements.items():
             name = re.sub(rf'\b{old}\b', new, name, flags=re.IGNORECASE)
-        
         name = re.sub(r'[!@#$%^&*(),.?":{}|<>]', '', name)
         name = re.sub(r'\s+', ' ', name).strip()
-        
         return name
 
 async def parse_caption(caption: str, user_info=None) -> str:
@@ -440,56 +420,40 @@ async def parse_caption(caption: str, user_info=None) -> str:
     global message_count, fixed_anime_name
     message_count += 1
     bot_stats["messages_processed"] += 1
-    
     if not caption:
         return ""
-    
     parser = AnimeParser()
     original_caption = caption.strip()
-    
     try:
-        # Clean and process caption
         clean_caption = original_caption
         if " - " in clean_caption and clean_caption.startswith("@"):
             parts = clean_caption.split(" - ", 1)
             if len(parts) > 1:
                 clean_caption = parts[1]
-        
         season, episode, extracted_name = parser.extract_episode_info(original_caption)
         quality = parser.extract_quality(original_caption)
         language = parser.extract_language(original_caption)
-        
         if fixed_anime_name:
             anime_name = fixed_anime_name
         else:
             anime_name = parser.clean_anime_name(extracted_name) or "Unknown Anime"
-        
         if language and language not in anime_name:
             anime_name = f"{anime_name} {language}".strip()
-        
         season_episode = f"[S{season}-E{episode}]"
-        
         extension = ".mkv"
         if ".mp4" in original_caption.lower():
             extension = ".mp4"
         elif ".avi" in original_caption.lower():
             extension = ".avi"
-        
         if prefixes:
             prefix_index = (message_count - 1) // 3 % len(prefixes)
             current_prefix = prefixes[prefix_index]
         else:
             current_prefix = "/leech -n"
-        
         formatted_caption = f"{current_prefix} {season_episode} {anime_name} [{quality}] [Single]{extension}"
-        
-        # Log successful formatting
         await log_manager.log_format_action(original_caption, formatted_caption, user_info, True)
-        
         return formatted_caption
-        
     except Exception as e:
-        # Log formatting error
         await log_manager.log_format_action(original_caption, "", user_info, False)
         logger.error(f"Caption parsing error: {e}\n{traceback.format_exc()}")
         return ""
@@ -497,13 +461,10 @@ async def parse_caption(caption: str, user_info=None) -> str:
 # =============================================================================
 # LOG CHANNEL MANAGEMENT COMMANDS
 # =============================================================================
-
 async def logchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /logchannel command"""
     global log_channel_id
-    
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     if not context.args:
         current_channel = log_channel_id or "Not configured"
         await update.message.reply_text(
@@ -521,9 +482,7 @@ async def logchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         await log_manager.log_user_command("logchannel", user_info)
         return
-    
     channel_input = ' '.join(context.args).strip()
-    
     if channel_input.lower() == "reset":
         log_channel_id = ""
         log_manager.log_channel = ""
@@ -537,13 +496,11 @@ async def logchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         await log_manager.log_user_command("logchannel_reset", user_info)
         return
-    
     if channel_input.startswith('-') or channel_input.startswith('@'):
         log_channel_id = channel_input
         log_manager.log_channel = channel_input
         log_manager.bot_context = context
         save_config()
-        
         await update.message.reply_text(
             f"✅ **Log channel set successfully!**\n\n"
             f"**Channel ID:** `{log_channel_id}`\n"
@@ -552,15 +509,12 @@ async def logchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode='Markdown',
             reply_to_message_id=update.message.message_id
         )
-        
-        # Test log channel by sending a test message
         await log_manager.log_action(
             "LOG_CHANNEL_CONFIGURED",
             f"Log channel set to {log_channel_id} by user",
             user_info,
             "SUCCESS"
         )
-        
         await log_manager.log_user_command("logchannel_set", user_info)
     else:
         await update.message.reply_text(
@@ -576,10 +530,8 @@ async def logchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stats command - detailed statistics"""
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     uptime = datetime.now(timezone.utc) - bot_stats["start_time"]
     success_rate = (bot_stats['successful_formats']/(bot_stats['successful_formats']+bot_stats['failed_formats'])*100) if (bot_stats['successful_formats']+bot_stats['failed_formats']) > 0 else 0
-    
     stats_message = (
         f"📊 **Detailed Bot Statistics**\n\n"
         f"⏰ **Uptime:** {uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m\n"
@@ -599,29 +551,23 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Log channel: **{'✅ Active' if log_channel_id else '❌ Not set'}**\n\n"
         f"🔥 **Total Errors:** {bot_stats['errors']}"
     )
-    
     await update.message.reply_text(
         stats_message,
         parse_mode='Markdown',
         reply_to_message_id=update.message.message_id
     )
-    
     await log_manager.log_user_command("stats", user_info)
 
 # =============================================================================
 # ENHANCED DUMP CHANNEL FUNCTIONALITY WITH LOGGING
 # =============================================================================
-
 async def send_to_dump_channel(context: ContextTypes.DEFAULT_TYPE, message, formatted_caption, user_info=None):
     """Send formatted caption to dump channel with enhanced logging"""
     global dump_channel_id
-    
     if not dump_channel_id:
         return False, "Dump channel not configured"
-    
     max_retries = 3
     retry_count = 0
-    
     while retry_count < max_retries:
         try:
             await context.bot.send_message(
@@ -632,11 +578,9 @@ async def send_to_dump_channel(context: ContextTypes.DEFAULT_TYPE, message, form
             logger.info(f"Successfully sent to dump channel: {dump_channel_id}")
             await log_manager.log_dump_channel_action(True, None, user_info)
             return True, "Success"
-            
         except TelegramError as e:
             retry_count += 1
             logger.warning(f"Failed to send to dump channel (attempt {retry_count}): {e}")
-            
             if "chat not found" in str(e).lower():
                 await log_manager.log_dump_channel_action(False, "Channel not found", user_info)
                 return False, "Dump channel not found"
@@ -646,18 +590,15 @@ async def send_to_dump_channel(context: ContextTypes.DEFAULT_TYPE, message, form
             elif retry_count >= max_retries:
                 await log_manager.log_dump_channel_action(False, f"Max retries exceeded: {e}", user_info)
                 return False, f"Failed after {max_retries} attempts: {e}"
-        
         except Exception as e:
             logger.error(f"Unexpected error sending to dump channel: {e}")
             await log_manager.log_dump_channel_action(False, f"Unexpected error: {e}", user_info)
             return False, f"Unexpected error: {e}"
-    
     return False, "Max retries exceeded"
 
 # =============================================================================
 # ENHANCED BOT COMMAND HANDLERS WITH LOGGING
 # =============================================================================
-
 async def setup_commands(application):
     """Set up bot commands menu with new log channel commands"""
     commands = [
@@ -681,12 +622,10 @@ async def setup_commands(application):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Enhanced start command with log channel info"""
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     try:
         await setup_commands(context.application)
     except Exception as e:
         logger.warning(f"Command menu setup: {e}")
-    
     welcome_message = (
         "🎬 **Professional Anime Caption Formatter** 🎬\n\n"
         "Enhanced with prefix management, dump channel, and log channel monitoring!\n\n"
@@ -714,7 +653,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send stats report to log channel"""
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     if not log_channel_id:
         await update.message.reply_text(
             "❌ **Log channel not configured!**\n\n"
@@ -723,7 +661,6 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_to_message_id=update.message.message_id
         )
         return
-    
     await log_manager.send_stats_report()
     await update.message.reply_text(
         "✅ **Stats report sent to log channel!**\n\n"
@@ -733,12 +670,10 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await log_manager.log_user_command("logs", user_info)
 
-# Copy all the existing command handlers with enhanced logging
 async def addprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addprefix command with logging"""
     global prefixes
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     if not context.args:
         await update.message.reply_text(
             "➕ **Add New Prefix**\n\n"
@@ -753,9 +688,7 @@ async def addprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await log_manager.log_user_command("addprefix", user_info, False)
         return
-    
     new_prefix = ' '.join(context.args).strip()
-    
     if new_prefix in prefixes:
         await update.message.reply_text(
             f"⚠️ **Prefix already exists!**\n\n"
@@ -766,10 +699,8 @@ async def addprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await log_manager.log_user_command("addprefix", user_info, False)
         return
-    
     prefixes.append(new_prefix)
     save_config()
-    
     await update.message.reply_text(
         f"✅ **Prefix added successfully!**\n\n"
         f"**New prefix:** `{new_prefix}`\n"
@@ -778,14 +709,12 @@ async def addprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown',
         reply_to_message_id=update.message.message_id
     )
-    
     await log_manager.log_action("PREFIX_ADDED", f"New prefix added: {new_prefix}", user_info, "SUCCESS")
     await log_manager.log_user_command("addprefix", user_info)
 
 async def prefixlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /prefixlist command with logging"""
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     if not prefixes:
         await update.message.reply_text(
             "❌ **No prefixes configured!**\n\n"
@@ -795,9 +724,7 @@ async def prefixlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         await log_manager.log_user_command("prefixlist", user_info)
         return
-    
     prefix_list = "\n".join([f"{i+1}. `{prefix}`" for i, prefix in enumerate(prefixes)])
-    
     await update.message.reply_text(
         f"📋 **Current Prefix List**\n\n"
         f"{prefix_list}\n\n"
@@ -815,7 +742,6 @@ async def delprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /delprefix command with logging"""
     global prefixes
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     if not context.args:
         if not prefixes:
             await update.message.reply_text(
@@ -826,7 +752,6 @@ async def delprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await log_manager.log_user_command("delprefix", user_info, False)
             return
-        
         prefix_list = "\n".join([f"{i+1}. `{prefix}`" for i, prefix in enumerate(prefixes)])
         await update.message.reply_text(
             f"➖ **Delete Prefix**\n\n"
@@ -838,10 +763,8 @@ async def delprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await log_manager.log_user_command("delprefix", user_info, False)
         return
-    
     try:
         index = int(context.args[0]) - 1
-        
         if index < 0 or index >= len(prefixes):
             await update.message.reply_text(
                 f"❌ **Invalid index!**\n\n"
@@ -852,10 +775,8 @@ async def delprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await log_manager.log_user_command("delprefix", user_info, False)
             return
-        
         deleted_prefix = prefixes.pop(index)
         save_config()
-        
         await update.message.reply_text(
             f"✅ **Prefix deleted successfully!**\n\n"
             f"**Deleted:** `{deleted_prefix}`\n"
@@ -863,10 +784,8 @@ async def delprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown',
             reply_to_message_id=update.message.message_id
         )
-        
         await log_manager.log_action("PREFIX_DELETED", f"Prefix deleted: {deleted_prefix}", user_info, "SUCCESS")
         await log_manager.log_user_command("delprefix", user_info)
-        
     except ValueError:
         await update.message.reply_text(
             f"❌ **Invalid number!**\n\n"
@@ -881,7 +800,6 @@ async def dumpchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Handle /dumpchannel command with logging"""
     global dump_channel_id
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     if not context.args:
         current_channel = dump_channel_id or "Not configured"
         await update.message.reply_text(
@@ -899,9 +817,7 @@ async def dumpchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         await log_manager.log_user_command("dumpchannel", user_info)
         return
-    
     channel_input = ' '.join(context.args).strip()
-    
     if channel_input.lower() == "reset":
         dump_channel_id = ""
         save_config()
@@ -915,11 +831,9 @@ async def dumpchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await log_manager.log_action("DUMP_CHANNEL_RESET", "Dump channel disabled", user_info, "SUCCESS")
         await log_manager.log_user_command("dumpchannel", user_info)
         return
-    
     if channel_input.startswith('-') or channel_input.startswith('@'):
         dump_channel_id = channel_input
         save_config()
-        
         await update.message.reply_text(
             f"✅ **Dump channel set successfully!**\n\n"
             f"**Channel ID:** `{dump_channel_id}`\n"
@@ -928,7 +842,6 @@ async def dumpchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode='Markdown',
             reply_to_message_id=update.message.message_id
         )
-        
         await log_manager.log_action("DUMP_CHANNEL_SET", f"Dump channel set to {dump_channel_id}", user_info, "SUCCESS")
         await log_manager.log_user_command("dumpchannel", user_info)
     else:
@@ -949,43 +862,29 @@ async def handle_media_with_caption(update: Update, context: ContextTypes.DEFAUL
     message = update.message
     original_caption = message.caption
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    
     if not original_caption:
         return
-    
     logger.info(f"Received caption from {user_info}: {original_caption}")
-    
-    # Parse and format the caption
     formatted_caption = await parse_caption(original_caption, user_info)
-    
     if formatted_caption and formatted_caption != original_caption:
         logger.info(f"Formatted caption: {formatted_caption}")
-        
-        # Send to dump channel if configured
         dump_success = False
         dump_message = ""
-        
         if dump_channel_id:
             dump_success, dump_message = await send_to_dump_channel(context, message, formatted_caption, user_info)
-        
-        # Prepare response message
         response_text = f"✅ **Professional Format Applied**\n\n`{formatted_caption}`\n\n"
-        
         if dump_channel_id:
             if dump_success:
                 response_text += "📤 **Sent to dump channel:** ✅\n"
             else:
                 response_text += f"📤 **Dump channel failed:** {dump_message}\n"
-        
         response_text += f"📊 **Processed:** {bot_stats['messages_processed']} total\n"
         response_text += "📋 Use `/stats` for detailed metrics"
-        
         await message.reply_text(
             response_text,
             parse_mode='Markdown',
             reply_to_message_id=message.message_id
         )
-        
         save_config()
     else:
         await message.reply_text(
@@ -1013,29 +912,53 @@ async def periodic_stats_task(context):
             logger.error(f"Periodic stats error: {e}")
 
 # =============================================================================
-# MAIN APPLICATION - Render Ready
+# MAIN APPLICATION - RENDER READY WITH HTTP SERVER
 # =============================================================================
-
 def main():
-    """Start the professional bot - Render optimized"""
+    """Start the professional bot - Render optimized with HTTP health check"""
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
         print("❌ Error: Please set your BOT_TOKEN environment variable!")
         print("Set BOT_TOKEN in Render dashboard environment variables")
         return
-    
+
     print("🚀 Starting Enhanced Professional Anime Caption Formatter Bot...")
-    print("🌐 Render Deployment: Optimized for cloud hosting")
+    print("🌐 Render Deployment: HTTP server + Telegram bot")
     print("📋 Features: Log channel monitoring, Stats tracking, Dump channel")
-    
+
+    # Start HTTP server in background thread for Render
+    print(f"🌐 Starting HTTP health server on port {os.environ.get('PORT', 10000)}...")
+    health_thread = Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+
     # Load configuration
     load_config()
     print(f"⚙️ Config loaded: {len(prefixes)} prefixes")
     print(f"📤 Dump channel: {'✅ Set' if dump_channel_id else '❌ Not set'}")
     print(f"📋 Log channel: {'✅ Set' if log_channel_id else '❌ Not set'}")
-    
+
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
+    # Add error handler
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle errors during polling"""
+        logger.error(f"Error occurred: {context.error}")
+        if isinstance(context.error, telegram.error.Conflict):
+            logger.error("Conflict detected: Another instance is running. Please ensure only one instance is active.")
+            await log_manager.log_action(
+                "BOT_CONFLICT",
+                "Conflict with another getUpdates request detected",
+                severity="ERROR"
+            )
+        elif isinstance(context.error, Exception):
+            await log_manager.log_action(
+                "BOT_ERROR",
+                f"Unexpected error: {str(context.error)}",
+                severity="ERROR"
+            )
+
+    application.add_error_handler(error_handler)
+
     # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stats", stats_command))
@@ -1045,7 +968,7 @@ def main():
     application.add_handler(CommandHandler("prefixlist", prefixlist_command))
     application.add_handler(CommandHandler("delprefix", delprefix_command))
     application.add_handler(CommandHandler("dumpchannel", dumpchannel_command))
-    
+
     # Add media handlers
     application.add_handler(MessageHandler(
         filters.Document.ALL & filters.CAPTION,
@@ -1059,20 +982,21 @@ def main():
         filters.PHOTO & filters.CAPTION,
         handle_media_with_caption
     ))
-    
+
     # Initialize log manager after application is created
     async def post_init(application):
         await init_log_manager(application)
         # Start periodic stats task
         asyncio.create_task(periodic_stats_task(application))
-    
+
     application.post_init = post_init
-    
+
     print("✅ Enhanced Professional bot is running on Render!")
+    print("🌐 HTTP health check server: Active")
     print("📊 Log channel monitoring: Active")
     print("🔥 All actions will be tracked and logged")
     print("📱 Command Menu: Available via Telegram")
-    
+
     # Run the bot
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
