@@ -1111,7 +1111,7 @@ async def handle_media_with_caption(update: Update, context: ContextTypes.DEFAUL
         dump_message = ""
         if dump_channel_id:
             dump_success, dump_message = await send_to_dump_channel(context, message, formatted_caption, user_info)
-        response_text = f"✅ **Formatted Caption:**\n\n`{formatted_caption}`\n\n"
+        response_text = f"\n`{formatted_caption}`\n"
         if dump_channel_id:
             if dump_success:
                 response_text += "📤 **Sent to dump channel:** ✅\n"
