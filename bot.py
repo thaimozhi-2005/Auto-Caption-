@@ -3,6 +3,7 @@
 Professional Telegram Bot for Anime Caption Formatting
 Enhanced with prefix management, dump channel functionality, log channel monitoring, and Render deployment ready
 WITH HTTP HEALTH CHECK SERVER FOR RENDER WEB SERVICE
+FIXED FOR RENDER DEPLOYMENT
 """
 import re
 import logging
@@ -21,8 +22,20 @@ from fastapi import FastAPI
 # =============================================================================
 # RENDER WEB SERVICE COMPATIBILITY - HTTP SERVER
 # =============================================================================
+# Initialize bot_stats BEFORE it's used in FastAPI endpoints
+bot_stats = {
+    "start_time": datetime.now(timezone.utc),
+    "messages_processed": 0,
+    "successful_formats": 0,
+    "failed_formats": 0,
+    "dump_channel_sends": 0,
+    "dump_channel_fails": 0,
+    "errors": 0
+}
+
 # Create FastAPI app for health checks
 fastapi_app = FastAPI(title="Telegram Bot Health Check")
+
 @fastapi_app.get("/")
 @fastapi_app.get("/health")
 async def health_check():
@@ -33,6 +46,7 @@ async def health_check():
         "uptime": str(datetime.now(timezone.utc) - bot_stats.get("start_time", datetime.now(timezone.utc))),
         "messages_processed": bot_stats.get("messages_processed", 0)
     }
+
 @fastapi_app.get("/stats")
 async def api_stats():
     """API endpoint for bot statistics"""
@@ -45,23 +59,28 @@ async def api_stats():
         "dump_channel_sends": bot_stats.get("dump_channel_sends", 0),
         "errors": bot_stats.get("errors", 0)
     }
+
 def start_health_server():
     """Start HTTP server for Render health checks"""
-    port = int(os.environ.get("PORT", 10000))  # Render uses PORT env var
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(fastapi_app, host="0.0.0.0", port=port, log_level="warning")
 
 # =============================================================================
 # CONFIGURATION SECTION - Render Ready
 # =============================================================================
 # Environment variables for security (set these in Render dashboard)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8480202493:AAHMwt8_S1jvYnDynbpKvmWPuTI2_q4HAN0")
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "")  # Set this in Render environment
-DUMP_CHANNEL_ID = os.getenv("DUMP_CHANNEL_ID", "")  # Optional default dump channel
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "")
+DUMP_CHANNEL_ID = os.getenv("DUMP_CHANNEL_ID", "")
+
+# Validate required environment variables
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required!")
+
 # Global variables
 fixed_anime_name = ""
 dump_channel_id = DUMP_CHANNEL_ID
 log_channel_id = LOG_CHANNEL_ID
-# Configuration file (will work on Render's ephemeral storage)
 CONFIG_FILE = "bot_config.json"
 
 # =============================================================================
@@ -78,16 +97,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 message_count = 0
 prefixes = ["/leech -n", "/leech1 -n", "/leech2 -n", "/leechx -n", "/leech4 -n", "/leech3 -n", "/leech5 -n"]
-# Bot statistics for monitoring
-bot_stats = {
-    "start_time": datetime.now(timezone.utc),
-    "messages_processed": 0,
-    "successful_formats": 0,
-    "failed_formats": 0,
-    "dump_channel_sends": 0,
-    "dump_channel_fails": 0,
-    "errors": 0
-}
 
 # =============================================================================
 # LOG CHANNEL SYSTEM
@@ -98,7 +107,7 @@ class LogChannelManager:
         self.bot_context = bot_context
         self.log_channel = log_channel_id
         self.message_buffer = []
-        self.buffer_size = 10  # Send logs in batches
+        self.buffer_size = 10
 
     async def log_action(self, action_type, details, user_info=None, severity="INFO"):
         """Log action to both file and Telegram channel"""
@@ -123,7 +132,10 @@ class LogChannelManager:
             logger.info(log_msg)
 
         if self.log_channel and self.bot_context:
-            await self._send_to_log_channel(log_entry)
+            try:
+                await self._send_to_log_channel(log_entry)
+            except Exception as e:
+                logger.error(f"Failed to send log to channel: {e}")
 
     async def _send_to_log_channel(self, log_entry):
         """Send formatted log to Telegram log channel"""
@@ -134,6 +146,7 @@ class LogChannelManager:
                 "ERROR": "❌",
                 "SUCCESS": "✅"
             }.get(log_entry["severity"], "📝")
+            
             message = (
                 f"{severity_emoji} **{log_entry['type']}**\n"
                 f"🕒 {log_entry['timestamp']}\n"
@@ -142,6 +155,7 @@ class LogChannelManager:
             if log_entry.get("user"):
                 message += f"👤 User: {log_entry['user']}\n"
             message += f"🔢 Stats: {bot_stats['messages_processed']} processed, {bot_stats['errors']} errors"
+            
             await self.bot_context.bot.send_message(
                 chat_id=self.log_channel,
                 text=message,
@@ -459,106 +473,6 @@ async def parse_caption(caption: str, user_info=None) -> str:
         return ""
 
 # =============================================================================
-# LOG CHANNEL MANAGEMENT COMMANDS
-# =============================================================================
-async def logchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /logchannel command"""
-    global log_channel_id
-    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    if not context.args:
-        current_channel = log_channel_id or "Not configured"
-        await update.message.reply_text(
-            f"📋 **Log Channel Settings**\n\n"
-            f"**Current channel:** `{current_channel}`\n\n"
-            f"**Usage:**\n"
-            f"• `/logchannel CHANNEL_ID` - Set log channel\n"
-            f"• `/logchannel reset` - Remove log channel\n\n"
-            f"**Examples:**\n"
-            f"• `/logchannel -1001234567890`\n"
-            f"• `/logchannel @logchannelname`\n"
-            f"• `/logchannel reset`",
-            parse_mode='Markdown',
-            reply_to_message_id=update.message.message_id
-        )
-        await log_manager.log_user_command("logchannel", user_info)
-        return
-    channel_input = ' '.join(context.args).strip()
-    if channel_input.lower() == "reset":
-        log_channel_id = ""
-        log_manager.log_channel = ""
-        save_config()
-        await update.message.reply_text(
-            "✅ **Log channel reset!**\n\n"
-            "Log channel monitoring disabled.\n"
-            "Use `/logchannel ID` to set a new channel.",
-            parse_mode='Markdown',
-            reply_to_message_id=update.message.message_id
-        )
-        await log_manager.log_user_command("logchannel_reset", user_info)
-        return
-    if channel_input.startswith('-') or channel_input.startswith('@'):
-        log_channel_id = channel_input
-        log_manager.log_channel = channel_input
-        log_manager.bot_context = context
-        save_config()
-        await update.message.reply_text(
-            f"✅ **Log channel set successfully!**\n\n"
-            f"**Channel ID:** `{log_channel_id}`\n"
-            f"**Status:** Monitoring active\n\n"
-            f"All bot actions will now be logged to this channel.",
-            parse_mode='Markdown',
-            reply_to_message_id=update.message.message_id
-        )
-        await log_manager.log_action(
-            "LOG_CHANNEL_CONFIGURED",
-            f"Log channel set to {log_channel_id} by user",
-            user_info,
-            "SUCCESS"
-        )
-        await log_manager.log_user_command("logchannel_set", user_info)
-    else:
-        await update.message.reply_text(
-            f"❌ **Invalid channel format!**\n\n"
-            f"**Valid formats:**\n"
-            f"• `-1001234567890` (Channel ID)\n"
-            f"• `@channelname` (Username)\n\n"
-            f"**Your input:** `{channel_input}`",
-            parse_mode='Markdown',
-            reply_to_message_id=update.message.message_id
-        )
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command - detailed statistics"""
-    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
-    uptime = datetime.now(timezone.utc) - bot_stats["start_time"]
-    success_rate = (bot_stats['successful_formats']/(bot_stats['successful_formats']+bot_stats['failed_formats'])*100) if (bot_stats['successful_formats']+bot_stats['failed_formats']) > 0 else 0
-    stats_message = (
-        f"📊 **Detailed Bot Statistics**\n\n"
-        f"⏰ **Uptime:** {uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m\n"
-        f"🚀 **Started:** {bot_stats['start_time'].strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        f"📈 **Processing Stats:**\n"
-        f"• Messages processed: **{bot_stats['messages_processed']}**\n"
-        f"• Successful formats: **{bot_stats['successful_formats']}**\n"
-        f"• Failed formats: **{bot_stats['failed_formats']}**\n"
-        f"• Success rate: **{success_rate:.1f}%**\n\n"
-        f"📤 **Dump Channel Stats:**\n"
-        f"• Successful sends: **{bot_stats['dump_channel_sends']}**\n"
-        f"• Failed sends: **{bot_stats['dump_channel_fails']}**\n\n"
-        f"⚙️ **Current Config:**\n"
-        f"• Anime name: **{fixed_anime_name or 'Auto-detect'}**\n"
-        f"• Prefixes: **{len(prefixes)}** total\n"
-        f"• Dump channel: **{'✅ Active' if dump_channel_id else '❌ Not set'}**\n"
-        f"• Log channel: **{'✅ Active' if log_channel_id else '❌ Not set'}**\n\n"
-        f"🔥 **Total Errors:** {bot_stats['errors']}"
-    )
-    await update.message.reply_text(
-        stats_message,
-        parse_mode='Markdown',
-        reply_to_message_id=update.message.message_id
-    )
-    await log_manager.log_user_command("stats", user_info)
-
-# =============================================================================
 # ENHANCED DUMP CHANNEL FUNCTIONALITY WITH LOGGING
 # =============================================================================
 async def send_to_dump_channel(context: ContextTypes.DEFAULT_TYPE, message, formatted_caption, user_info=None):
@@ -650,6 +564,191 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_message, parse_mode='Markdown')
     await log_manager.log_user_command("start", user_info)
 
+async def name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /name command for setting fixed anime name"""
+    global fixed_anime_name
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    
+    if not context.args:
+        current_name = fixed_anime_name or "Auto-detect (from captions)"
+        await update.message.reply_text(
+            f"📝 **Anime Name Setting**\n\n"
+            f"**Current:** {current_name}\n\n"
+            f"**Usage:**\n"
+            f"• `/name Your Anime Name` - Set fixed name\n"
+            f"• `/name reset` - Enable auto-detection\n\n"
+            f"**Examples:**\n"
+            f"• `/name Naruto Shippuden`\n"
+            f"• `/name One Piece Tam`\n"
+            f"• `/name reset`",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        await log_manager.log_user_command("name", user_info)
+        return
+    
+    name_input = ' '.join(context.args).strip()
+    
+    if name_input.lower() == "reset":
+        fixed_anime_name = ""
+        save_config()
+        await update.message.reply_text(
+            "✅ **Auto-detection enabled!**\n\n"
+            "Anime names will now be extracted from captions automatically.",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        await log_manager.log_action("NAME_RESET", "Auto-detection enabled", user_info, "SUCCESS")
+    else:
+        fixed_anime_name = name_input
+        save_config()
+        await update.message.reply_text(
+            f"✅ **Fixed anime name set!**\n\n"
+            f"**Name:** {fixed_anime_name}\n\n"
+            f"All captions will now use this name instead of auto-detection.",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        await log_manager.log_action("NAME_SET", f"Fixed name set to: {fixed_anime_name}", user_info, "SUCCESS")
+    
+    await log_manager.log_user_command("name", user_info)
+
+async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /format command for testing caption formatting"""
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    
+    if not context.args:
+        await update.message.reply_text(
+            "🔧 **Test Caption Formatting**\n\n"
+            "**Usage:** `/format YOUR_CAPTION_TEXT`\n\n"
+            "**Example:**\n"
+            "`/format @channel - Naruto S01 EP05 [720p] Tamil`\n\n"
+            "**Supported formats:**\n"
+            "• `@channel - Anime Name S01 EP05`\n"
+            "• `[S01E05] Anime Name [720p]`\n"
+            "• `📺 Anime Name [S01] Episode: 5`\n"
+            "• And many more!",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        await log_manager.log_user_command("format", user_info, False)
+        return
+    
+    test_caption = ' '.join(context.args)
+    formatted = await parse_caption(test_caption, user_info)
+    
+    if formatted:
+        await update.message.reply_text(
+            f"🔧 **Format Test Result**\n\n"
+            f"**Original:**\n`{test_caption}`\n\n"
+            f"**Formatted:**\n`{formatted}`\n\n"
+            f"✅ Successfully parsed and formatted!",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ **Format Test Failed**\n\n"
+            f"**Input:**\n`{test_caption}`\n\n"
+            f"Could not parse this format. Try a different caption structure or check `/help` for supported formats.",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+    
+    await log_manager.log_user_command("format", user_info)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command - current bot status"""
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    
+    uptime = datetime.now(timezone.utc) - bot_stats["start_time"]
+    
+    status_message = (
+        f"📊 **Bot Status**\n\n"
+        f"🟢 **Status:** Online & Active\n"
+        f"⏰ **Uptime:** {uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m\n\n"
+        f"**Current Configuration:**\n"
+        f"• **Anime Name:** {fixed_anime_name or 'Auto-detect'}\n"
+        f"• **Active Prefixes:** {len(prefixes)}\n"
+        f"• **Dump Channel:** {'✅ Active' if dump_channel_id else '❌ Not set'}\n"
+        f"• **Log Channel:** {'✅ Active' if log_channel_id else '❌ Not set'}\n\n"
+        f"**Quick Stats:**\n"
+        f"• Messages processed: {bot_stats['messages_processed']}\n"
+        f"• Success rate: {(bot_stats['successful_formats']/(bot_stats['successful_formats']+bot_stats['failed_formats'])*100) if (bot_stats['successful_formats']+bot_stats['failed_formats']) > 0 else 0:.1f}%\n\n"
+        f"Use `/stats` for detailed metrics"
+    )
+    
+    await update.message.reply_text(
+        status_message,
+        parse_mode='Markdown',
+        reply_to_message_id=update.message.message_id
+    )
+    await log_manager.log_user_command("status", user_info)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command - detailed help"""
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    
+    help_message = (
+        "❓ **Professional Anime Bot Help**\n\n"
+        "**🎬 Main Function:**\nSend videos/documents with captions to get professionally formatted captions!\n\n"
+        "**📝 Supported Input Formats:**\n"
+        "• `@channel - Anime Name S01 EP05 [720p]`\n"
+        "• `[S01E05] Anime Name [1080p] Tamil`\n"
+        "• `📺 Anime Name [S01] Episode: 5 Quality: 720p`\n"
+        "• `Anime Name S1 E5 Multi Audio`\n\n"
+        "**🔧 Commands:**\n"
+        "• `/name ANIME` - Set fixed anime name\n"
+        "• `/format TEXT` - Test formatting\n"
+        "• `/addprefix PREFIX` - Add new prefix\n"
+        "• `/prefixlist` - View all prefixes\n"
+        "• `/delprefix NUM` - Delete prefix by number\n"
+        "• `/dumpchannel ID` - Set dump channel\n"
+        "• `/logchannel ID` - Set log channel\n"
+        "• `/stats` - Detailed statistics\n"
+        "• `/status` - Current bot status\n\n"
+        "**🎥 Quality Detection:**\n480P, 720P, 1080P (auto-detected)\n\n"
+        "**🌍 Language Support:**\nTamil, English, Multi, Dual (auto-detected)\n\n"
+        "**💡 Tips:**\n"
+        "• Set fixed name with `/name` for consistency\n"
+        "• Use dump channel to collect all formatted captions\n"
+        "• Log channel tracks all bot activity"
+    )
+    
+    await update.message.reply_text(
+        help_message,
+        parse_mode='Markdown',
+        reply_to_message_id=update.message.message_id
+    )
+    await log_manager.log_user_command("help", user_info)
+
+async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /quality command - show quality info"""
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    
+    quality_message = (
+        "🎥 **Video Quality Support**\n\n"
+        "**🎯 Priority Order:**\n"
+        "1. **480P** - Standard Definition\n"
+        "2. **720P** - High Definition (Default)\n"
+        "3. **1080P** - Full HD\n\n"
+        "**📱 Detection Patterns:**\n"
+        "• `[720p]`, `720P`, `720`\n"
+        "• `Quality: 1080p`\n"
+        "• `Qᴜᴀʟɪᴛʏ: 480P`\n\n"
+        "**⚡ Auto-Detection:**\n"
+        "The bot automatically detects quality from captions and formats accordingly. If no quality is found, defaults to **720P**.\n\n"
+        "**✅ Supported Qualities:**\n"
+        "144P, 240P, 360P, 480P, 720P, 1080P, 1440P, 2160P"
+    )
+    
+    await update.message.reply_text(
+        quality_message,
+        parse_mode='Markdown',
+        reply_to_message_id=update.message.message_id
+    )
+    await log_manager.log_user_command("quality", user_info)
+
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send stats report to log channel"""
     user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
@@ -669,6 +768,103 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_to_message_id=update.message.message_id
     )
     await log_manager.log_user_command("logs", user_info)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats command - detailed statistics"""
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    uptime = datetime.now(timezone.utc) - bot_stats["start_time"]
+    success_rate = (bot_stats['successful_formats']/(bot_stats['successful_formats']+bot_stats['failed_formats'])*100) if (bot_stats['successful_formats']+bot_stats['failed_formats']) > 0 else 0
+    stats_message = (
+        f"📊 **Detailed Bot Statistics**\n\n"
+        f"⏰ **Uptime:** {uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m\n"
+        f"🚀 **Started:** {bot_stats['start_time'].strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"📈 **Processing Stats:**\n"
+        f"• Messages processed: **{bot_stats['messages_processed']}**\n"
+        f"• Successful formats: **{bot_stats['successful_formats']}**\n"
+        f"• Failed formats: **{bot_stats['failed_formats']}**\n"
+        f"• Success rate: **{success_rate:.1f}%**\n\n"
+        f"📤 **Dump Channel Stats:**\n"
+        f"• Successful sends: **{bot_stats['dump_channel_sends']}**\n"
+        f"• Failed sends: **{bot_stats['dump_channel_fails']}**\n\n"
+        f"⚙️ **Current Config:**\n"
+        f"• Anime name: **{fixed_anime_name or 'Auto-detect'}**\n"
+        f"• Prefixes: **{len(prefixes)}** total\n"
+        f"• Dump channel: **{'✅ Active' if dump_channel_id else '❌ Not set'}**\n"
+        f"• Log channel: **{'✅ Active' if log_channel_id else '❌ Not set'}**\n\n"
+        f"🔥 **Total Errors:** {bot_stats['errors']}"
+    )
+    await update.message.reply_text(
+        stats_message,
+        parse_mode='Markdown',
+        reply_to_message_id=update.message.message_id
+    )
+    await log_manager.log_user_command("stats", user_info)
+
+async def logchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /logchannel command"""
+    global log_channel_id
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    if not context.args:
+        current_channel = log_channel_id or "Not configured"
+        await update.message.reply_text(
+            f"📋 **Log Channel Settings**\n\n"
+            f"**Current channel:** `{current_channel}`\n\n"
+            f"**Usage:**\n"
+            f"• `/logchannel CHANNEL_ID` - Set log channel\n"
+            f"• `/logchannel reset` - Remove log channel\n\n"
+            f"**Examples:**\n"
+            f"• `/logchannel -1001234567890`\n"
+            f"• `/logchannel @logchannelname`\n"
+            f"• `/logchannel reset`",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        await log_manager.log_user_command("logchannel", user_info)
+        return
+    channel_input = ' '.join(context.args).strip()
+    if channel_input.lower() == "reset":
+        log_channel_id = ""
+        log_manager.log_channel = ""
+        save_config()
+        await update.message.reply_text(
+            "✅ **Log channel reset!**\n\n"
+            "Log channel monitoring disabled.\n"
+            "Use `/logchannel ID` to set a new channel.",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        await log_manager.log_user_command("logchannel_reset", user_info)
+        return
+    if channel_input.startswith('-') or channel_input.startswith('@'):
+        log_channel_id = channel_input
+        log_manager.log_channel = channel_input
+        log_manager.bot_context = context
+        save_config()
+        await update.message.reply_text(
+            f"✅ **Log channel set successfully!**\n\n"
+            f"**Channel ID:** `{log_channel_id}`\n"
+            f"**Status:** Monitoring active\n\n"
+            f"All bot actions will now be logged to this channel.",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        await log_manager.log_action(
+            "LOG_CHANNEL_CONFIGURED",
+            f"Log channel set to {log_channel_id} by user",
+            user_info,
+            "SUCCESS"
+        )
+        await log_manager.log_user_command("logchannel_set", user_info)
+    else:
+        await update.message.reply_text(
+            f"❌ **Invalid channel format!**\n\n"
+            f"**Valid formats:**\n"
+            f"• `-1001234567890` (Channel ID)\n"
+            f"• `@channelname` (Username)\n\n"
+            f"**Your input:** `{channel_input}`",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
 
 async def addprefix_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addprefix command with logging"""
@@ -856,6 +1052,49 @@ async def dumpchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         await log_manager.log_user_command("dumpchannel", user_info, False)
 
+async def dumpstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /dumpstatus command"""
+    user_info = f"{update.effective_user.first_name} (@{update.effective_user.username})" if update.effective_user.username else update.effective_user.first_name
+    
+    if not dump_channel_id:
+        await update.message.reply_text(
+            "📡 **Dump Channel Status**\n\n"
+            "❌ **Not configured**\n\n"
+            "Use `/dumpchannel CHANNEL_ID` to set up dump channel functionality.",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+    else:
+        # Test connection to dump channel
+        try:
+            test_msg = await context.bot.send_message(
+                chat_id=dump_channel_id,
+                text="🔄 **Connection Test**\n\nDump channel is working properly!",
+                parse_mode='Markdown'
+            )
+            await update.message.reply_text(
+                f"📡 **Dump Channel Status**\n\n"
+                f"✅ **Active & Connected**\n"
+                f"**Channel:** `{dump_channel_id}`\n"
+                f"**Successful sends:** {bot_stats['dump_channel_sends']}\n"
+                f"**Failed sends:** {bot_stats['dump_channel_fails']}\n\n"
+                f"Test message sent successfully!",
+                parse_mode='Markdown',
+                reply_to_message_id=update.message.message_id
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"📡 **Dump Channel Status**\n\n"
+                f"❌ **Connection Failed**\n"
+                f"**Channel:** `{dump_channel_id}`\n"
+                f"**Error:** {str(e)}\n\n"
+                f"Please check channel ID and bot permissions.",
+                parse_mode='Markdown',
+                reply_to_message_id=update.message.message_id
+            )
+    
+    await log_manager.log_user_command("dumpstatus", user_info)
+
 # Enhanced message handlers with logging
 async def handle_media_with_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle video/document/file messages with captions - Enhanced with logging"""
@@ -872,7 +1111,7 @@ async def handle_media_with_caption(update: Update, context: ContextTypes.DEFAUL
         dump_message = ""
         if dump_channel_id:
             dump_success, dump_message = await send_to_dump_channel(context, message, formatted_caption, user_info)
-        response_text = f"✅ **Professional Format Applied**\n\n`{formatted_caption}`\n\n"
+        response_text = f"✅ **Formatted Caption:**\n\n`{formatted_caption}`\n\n"
         if dump_channel_id:
             if dump_success:
                 response_text += "📤 **Sent to dump channel:** ✅\n"
@@ -912,11 +1151,26 @@ async def periodic_stats_task(context):
             logger.error(f"Periodic stats error: {e}")
 
 # =============================================================================
+# ERROR HANDLING
+# =============================================================================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors during polling"""
+    logger.error(f"Error occurred: {context.error}")
+    bot_stats["errors"] += 1
+    
+    if hasattr(context, 'error') and context.error:
+        await log_manager.log_action(
+            "BOT_ERROR",
+            f"Unexpected error: {str(context.error)}",
+            severity="ERROR"
+        )
+
+# =============================================================================
 # MAIN APPLICATION - RENDER READY WITH HTTP SERVER
 # =============================================================================
 def main():
     """Start the professional bot - Render optimized with HTTP health check"""
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
+    if not BOT_TOKEN:
         print("❌ Error: Please set your BOT_TOKEN environment variable!")
         print("Set BOT_TOKEN in Render dashboard environment variables")
         return
@@ -936,38 +1190,27 @@ def main():
     print(f"📤 Dump channel: {'✅ Set' if dump_channel_id else '❌ Not set'}")
     print(f"📋 Log channel: {'✅ Set' if log_channel_id else '❌ Not set'}")
 
-    # Create application
+    # Create application  application.add_handler(CommandHandler("
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Add error handler
-    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle errors during polling"""
-        logger.error(f"Error occurred: {context.error}")
-        if isinstance(context.error, telegram.error.Conflict):
-            logger.error("Conflict detected: Another instance is running. Please ensure only one instance is active.")
-            await log_manager.log_action(
-                "BOT_CONFLICT",
-                "Conflict with another getUpdates request detected",
-                severity="ERROR"
-            )
-        elif isinstance(context.error, Exception):
-            await log_manager.log_action(
-                "BOT_ERROR",
-                f"Unexpected error: {str(context.error)}",
-                severity="ERROR"
-            )
-
     application.add_error_handler(error_handler)
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("name", name_command))
+    application.add_handler(CommandHandler("format", format_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("logchannel", logchannel_command))
-    application.add_handler(CommandHandler("logs", logs_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("quality", quality_command))
     application.add_handler(CommandHandler("addprefix", addprefix_command))
     application.add_handler(CommandHandler("prefixlist", prefixlist_command))
     application.add_handler(CommandHandler("delprefix", delprefix_command))
     application.add_handler(CommandHandler("dumpchannel", dumpchannel_command))
+    application.add_handler(CommandHandler("dumpstatus", dumpstatus_command))
+    application.add_handler(CommandHandler("logchannel", logchannel_command))
+    application.add_handler(CommandHandler("logs", logs_command))
 
     # Add media handlers
     application.add_handler(MessageHandler(
