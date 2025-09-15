@@ -121,7 +121,7 @@ class AnimeParser:
             'simple_se': r'S(\d+)\s*E(\d+)',  # S01 E12
             'simple_ep': r'S(\d+)\s*EP(\d+)',  # S01 EP01
         }
-    
+    def extract_episode_info(self, text):
     """Extract season, episode, and anime name from various formats"""
         season = "01"
         episode = "01"
